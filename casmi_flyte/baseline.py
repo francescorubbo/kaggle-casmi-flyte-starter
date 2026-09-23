@@ -58,6 +58,19 @@ def _neutral_masses(table: pa.Table) -> np.ndarray:
     )
 
 
+def _column_stats(Y: np.ndarray, block: int = 16_384) -> tuple[np.ndarray, np.ndarray]:
+    """Column mean and std computed blockwise (np.std would allocate a full-size temporary)."""
+    total = np.zeros(Y.shape[1], dtype=np.float64)
+    total_sq = np.zeros(Y.shape[1], dtype=np.float64)
+    for s in range(0, len(Y), block):
+        b = Y[s : s + block].astype(np.float64)
+        total += b.sum(0)
+        total_sq += (b * b).sum(0)
+    mu = total / len(Y)
+    sd = np.sqrt(np.maximum(total_sq / len(Y) - mu**2, 0)) + 1e-6
+    return mu.astype(np.float32), sd.astype(np.float32)
+
+
 def _similarity(pred: np.ndarray, cands: np.ndarray, binary: bool) -> np.ndarray:
     if binary:  # soft Tanimoto between predicted bit probabilities and candidate bits
         cands = cands.astype(np.float32)
@@ -82,23 +95,27 @@ async def evaluate_representation(
     from sklearn.neural_network import MLPClassifier, MLPRegressor
 
     t0 = time.time()
+    # Memory matters here: a full library is up to 277k x 4860 bits. Keep one copy of the matrix.
     lib = await read_table(features, columns=["inchikey14", "valid", representation])
-    lib = lib.filter(lib["valid"])
     mass_table = await read_table(masses, columns=["inchikey14", "exact_mass", "valid"])
     mass_table = mass_table.filter(mass_table["valid"])
     # (pyarrow joins do not support fixed-size-list payload columns: look the masses up instead)
     mass_of = dict(zip(mass_table["inchikey14"].to_pylist(), mass_table["exact_mass"].to_pylist()))
-    lib_mass_raw = np.array([mass_of.get(k, np.nan) for k in lib["inchikey14"].to_pylist()])
-    lib = lib.filter(pa.array(~np.isnan(lib_mass_raw))).append_column(
-        "exact_mass", pa.array(lib_mass_raw[~np.isnan(lib_mass_raw)])
-    )
-    Y_lib = column_matrix(lib[representation])
+    all_keys = lib["inchikey14"].to_pylist()
+    all_mass = np.array([mass_of.get(k, np.nan) for k in all_keys])
+    keep = lib["valid"].to_numpy(zero_copy_only=False) & ~np.isnan(all_mass)
+    Y_lib = column_matrix(lib[representation], mask=keep)  # the one copy
+    del lib, mass_table, mass_of
+    lib_keys_all = np.array(all_keys)[keep]
+    lib_mass_all = all_mass[keep]
     binary = Y_lib.dtype == np.uint8  # fingerprints are stored as uint8 bits, descriptors as float32
-    if not binary:  # standardise continuous features so that no descriptor dominates the cosine
-        Y_lib = np.nan_to_num(Y_lib.astype(np.float32))
-        mu, sd = Y_lib.mean(0), Y_lib.std(0) + 1e-6
-        Y_lib = (Y_lib - mu) / sd
-    key_to_row = {k: i for i, k in enumerate(lib["inchikey14"].to_pylist())}
+    if not binary:  # standardise continuous features (in place) so that no descriptor dominates the cosine
+        Y_lib = np.nan_to_num(Y_lib.astype(np.float32, copy=False), copy=False)
+        mu, sd = _column_stats(Y_lib)
+        for s in range(0, len(Y_lib), 16_384):  # blockwise: no full-size temporaries
+            Y_lib[s : s + 16_384] -= mu
+            Y_lib[s : s + 16_384] /= sd
+    key_to_row = {k: i for i, k in enumerate(lib_keys_all)}
     print(f"{representation}: library of {len(key_to_row):,} molecules x {Y_lib.shape[1]} ({'bits' if binary else 'floats'})")
 
     # --- training --------------------------------------------------------------------------
@@ -110,11 +127,20 @@ async def evaluate_representation(
         pick = np.sort(np.random.default_rng(0).choice(train.num_rows, max_train_spectra, replace=False))
         train, rows = train.take(pa.array(pick)), rows[pick]
     X = bin_spectra(train)
-    Y = Y_lib[rows]
-    print(f"training on {X.shape[0]:,} spectra, {X.shape[1]} features -> {Y.shape[1]} targets")
+    del train
+    print(f"training on {X.shape[0]:,} spectra, {X.shape[1]} features -> {Y_lib.shape[1]} targets")
     Model = MLPClassifier if binary else MLPRegressor
-    model = Model(hidden_layer_sizes=(512,), batch_size=256, max_iter=epochs, learning_rate_init=1e-3, random_state=0)
-    model.fit(X, Y.astype(np.int8) if binary else Y)
+    model = Model(hidden_layer_sizes=(512,), learning_rate_init=1e-3, random_state=0)
+    # Mini-batches through partial_fit: sklearn expands multi-label targets to int64, so the full
+    # (n_spectra x n_bits) target matrix would not fit in the pod; one batch at a time does.
+    rng, batch = np.random.default_rng(0), 256
+    extra = {"classes": np.arange(Y_lib.shape[1])} if binary else {}  # multi-label: one "class" per bit
+    for epoch in range(epochs):
+        order = rng.permutation(len(rows))
+        for start in range(0, len(order), batch):
+            idx = order[start : start + batch]
+            model.partial_fit(X[idx], Y_lib[rows[idx]], **extra)
+        print(f"epoch {epoch + 1}/{epochs}, loss {model.loss_:.4f}")
     t_train = time.time() - t0
 
     # --- retrieval on the hold-out -----------------------------------------------------------
@@ -124,10 +150,8 @@ async def evaluate_representation(
     M = _neutral_masses(hold)
     keys = np.array(hold["inchikey14"].to_pylist())
 
-    order = np.argsort(lib["exact_mass"].to_numpy())
-    lib_mass = lib["exact_mass"].to_numpy()[order]
-    lib_keys = np.array(lib["inchikey14"].to_pylist())[order]
-    Y_sorted = Y_lib[order]
+    order = np.argsort(lib_mass_all)
+    lib_mass, lib_keys = lib_mass_all[order], lib_keys_all[order]
 
     rng = np.random.default_rng(0)
     predictions, random_predictions, n_cands, answers, in_window = {}, {}, [], {}, []
@@ -140,7 +164,7 @@ async def evaluate_representation(
         answers[mol] = mol  # pseudo molecule_id = its InChIKey14
         if hi == lo:
             continue
-        sim = _similarity(P[sel].mean(axis=0), Y_sorted[lo:hi], binary)
+        sim = _similarity(P[sel].mean(axis=0), Y_lib[order[lo:hi]], binary)
         predictions[mol] = list(lib_keys[lo:hi][np.argsort(-sim)[:K]])
         random_predictions[mol] = list(rng.permutation(lib_keys[lo:hi])[:K])
 

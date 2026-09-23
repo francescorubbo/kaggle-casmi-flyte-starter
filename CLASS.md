@@ -56,7 +56,7 @@ Kaggle test set:
 - **No network access at task runtime.** A Kaggle submission runs offline, and so do your pods.
   Anything a task needs must already be in its image.
 - A **development run** (on a sample of the data) takes under 5 minutes once images are built.
-- The **full run** takes under ~90 minutes. If a featurizer can't cover every molecule within
+- The **full run** takes under ~2 hours. If a featurizer can't cover every molecule within
   that budget, cover what you can and report its coverage.
 - Rerunning with unchanged code and inputs recomputes nothing.
 - One molecule a toolkit can't parse must not fail the run.
