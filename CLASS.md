@@ -14,16 +14,22 @@ One classic approach: **predict a molecular representation from the spectrum, th
 library molecules of the right mass whose representation is most similar.** Which representation
 works best is an open question, and nobody can answer it until the representations exist.
 
-Your job today is to build the pipeline that computes them for the whole training set and scores
+Your job today is to build the pipeline that computes the molecular representations for the whole training set and scores
 each one.
 
 ## The data
 
-`train.parquet` has 2.5M spectra with known structures, 3 GB. It is available to your cluster at
+`train.parquet` has 2.5M spectra with known structures, 3 GB. It lives in an S3 bucket on
+[SWITCH](https://www.switch.ch/) (S3-compatible, not AWS):
 
 ```
-CASMI_TRAIN_URI = s3://<TBD>/train.parquet
+CASMI_TRAIN_URI = s3://302-data/kaggle_CASMI2026/train.parquet
+endpoint        = https://zhw-a.s3.cloud.switch.ch      (region: ch)
 ```
+
+You'll receive an access key for the bucket. It is **not** the storage your cluster uses for its own
+data, so your tasks need to be given the credentials: see `flyte create secret` and
+`flyte.Secret`. Never put keys in code or images.
 
 Columns you will care about: `normalized_smiles`, `inchikey14`, `adduct`, `precursor_mz`,
 `ms2_mzs`, `ms2_normalized_intensities`, `collision_energy_ev`, `ingest_lib`. The

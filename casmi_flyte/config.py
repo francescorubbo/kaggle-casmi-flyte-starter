@@ -3,8 +3,12 @@
 import os
 
 
-# Where the training data lives (the instructor will give you the exact URI).
-TRAIN_URI = os.getenv("CASMI_TRAIN_URI", "s3://flyte-data/casmi/train.parquet")
+# The training data, on SWITCH's S3 (not AWS, and not the cluster's own object store). Tasks read it
+# with their own credentials, from the two Flyte secrets below; endpoint and region are not secret.
+TRAIN_URI = os.getenv("CASMI_TRAIN_URI", "s3://302-data/kaggle_CASMI2026/train.parquet")
+SOURCE_S3_ENDPOINT = os.getenv("CASMI_S3_ENDPOINT", "https://zhw-a.s3.cloud.switch.ch")
+SOURCE_S3_REGION = os.getenv("CASMI_S3_REGION", "ch")
+SOURCE_S3_SECRETS = ("casmi-s3-access-key-id", "casmi-s3-secret-access-key")  # `flyte create secret ...`
 
 
 # RDKit version used by the competition metric.

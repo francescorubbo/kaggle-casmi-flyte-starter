@@ -30,13 +30,25 @@ async def read_table(f: File, columns: list[str] | None = None) -> pa.Table:
     return read_local_table(await f.download(), columns=columns)
 
 
+def content_hash(path: str | Path, chunk: int = 64 << 20) -> str:
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=20)
+    with open(path, "rb") as fh:
+        while block := fh.read(chunk):
+            h.update(block)
+    return h.hexdigest()
+
+
 async def write_table(table: pa.Table, name: str) -> File:
+    """Write and upload. The File's cache key is its *content* hash, not its (random) storage path:
+    identical outputs from a re-executed upstream task keep downstream caches valid."""
     path = Path(tempfile.mkdtemp()) / name
     if name.endswith(".arrow"):
         feather.write_feather(table, str(path), compression="zstd")
     else:
         pq.write_table(table, path, compression="zstd")
-    return await File.from_local(str(path))
+    return await File.from_local(str(path), hash_method=content_hash(path))
 
 
 def matrix_column(x: np.ndarray) -> pa.FixedSizeListArray:
