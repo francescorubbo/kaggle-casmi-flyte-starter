@@ -11,6 +11,8 @@ casmi_flyte/tables.py
 pyproject.toml
 snippets/cdk_jpype.py
 snippets/chemeleon.py
+snippets/mordred_desc.py
+snippets/rdkit_fp.py
 tests/test_helpers.py
 tests/test_metric.py
 uv.lock

@@ -130,9 +130,11 @@ to orchestration is provided, so you can spend the day on the pipeline:
   and how it runs.
 - `casmi_flyte/tables.py`: parquet ↔ `flyte.io.File` helpers, fingerprint matrix ↔ column, and
   polars helpers to merge parquet files (streaming) and scan them lazily. The evaluation needs polars.
-- `snippets/cdk_jpype.py` and `snippets/chemeleon.py`: the two awkward APIs, i.e. CDK
-  fingerprints through JPype, and CheMeleon embeddings from a local weights file. They are plain
-  functions: making them run somewhere is your job.
+- `snippets/`: the featurizer calls, so you don't spend the day on library parameters.
+  `rdkit_fp.py` (the four fingerprints and the monoisotopic mass), `mordred_desc.py` (all 2D
+  descriptors), `cdk_jpype.py` (CDK fingerprints through JPype) and `chemeleon.py` (CheMeleon
+  embeddings from a local weights file). Each is a plain function, SMILES in, arrays and a `valid`
+  mask out: making them run somewhere (images, dependencies, resources) is your job.
 - `tests/`: tests for the metric and the helpers. Add your own.
 
 ## Checkpoints
