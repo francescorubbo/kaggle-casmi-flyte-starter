@@ -1,33 +1,36 @@
-"""Tiny helpers to move pyarrow tables in and out of flyte.io.File.
+"""Tiny helpers to move tables in and out of flyte.io.File. Every file is parquet.
 
-Two formats, chosen by the file name passed to `write_table`:
-* `.parquet` - compact, the default for most intermediate files.
-* `.arrow` (Arrow IPC / Feather v2) - for big fingerprint matrices. Parquet stores fixed-size lists
-  as repeated fields, and reading them back materialises two int16 "levels" per value: for
-  277k molecules x 4860 bits that is several GB on top of the data. IPC stores them as-is.
-`read_table` detects the format from the file itself.
+Small tables (shards, spectra) go through pyarrow. Big feature files go through polars: pyarrow's
+parquet reader materialises two int16 "levels" per value of a fixed-size-list column, so 276k
+molecules x 4860 fingerprint bits cost several GB on top of the data. polars' reader doesn't, and its
+lazy API lets `scan_table` select and filter before anything is loaded. polars is imported inside
+the functions that use it: only images that merge or read feature libraries need it.
 """
 
+import asyncio
+import os
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.feather as feather
 import pyarrow.parquet as pq
 from flyte.io import File
 
-
-def read_local_table(path: str, columns: list[str] | None = None) -> pa.Table:
-    with open(path, "rb") as fh:
-        magic = fh.read(6)
-    if magic == b"ARROW1":
-        return feather.read_table(path, columns=columns, memory_map=True)
-    return pq.read_table(path, columns=columns)
+# Rows per row group in merged feature files. Small groups keep the streaming merge at ~1.5 GB for
+# the full Klekota-Roth library; 16k-row groups needed 4.5 GB, 64k-row groups 8 GB.
+MERGE_ROW_GROUP_SIZE = 2048
 
 
 async def read_table(f: File, columns: list[str] | None = None) -> pa.Table:
-    return read_local_table(await f.download(), columns=columns)
+    return pq.read_table(await f.download(), columns=columns)
+
+
+async def scan_table(f: File):
+    """Lazy polars frame over a parquet File: `select`/`filter`, then `collect(engine="streaming")`."""
+    import polars as pl
+
+    return pl.scan_parquet(await f.download())
 
 
 def content_hash(path: str | Path, chunk: int = 64 << 20) -> str:
@@ -40,43 +43,43 @@ def content_hash(path: str | Path, chunk: int = 64 << 20) -> str:
     return h.hexdigest()
 
 
-async def write_table(table: pa.Table, name: str) -> File:
-    """Write and upload. The File's cache key is its *content* hash, not its (random) storage path:
-    identical outputs from a re-executed upstream task keep downstream caches valid."""
-    path = Path(tempfile.mkdtemp()) / name
-    if name.endswith(".arrow"):
-        feather.write_feather(table, str(path), compression="zstd")
-    else:
-        pq.write_table(table, path, compression="zstd")
+async def _upload(path: Path) -> File:
+    """The File's cache key is its *content* hash, not its (random) storage path: identical outputs
+    from a re-executed upstream task keep downstream caches valid."""
     return await File.from_local(str(path), hash_method=content_hash(path))
 
 
+async def write_table(table: pa.Table, name: str) -> File:
+    """Write `table` as parquet and upload it."""
+    path = Path(tempfile.mkdtemp()) / name
+    pq.write_table(table, path, compression="zstd")
+    return await _upload(path)
+
+
+def merge_local(paths: list[str], out: str | Path) -> None:
+    """Concatenate parquet files into `out` with polars' streaming engine: memory stays at a few
+    row groups, not the whole table."""
+    import polars as pl
+
+    pl.scan_parquet(paths).sink_parquet(out, compression="zstd", row_group_size=MERGE_ROW_GROUP_SIZE)
+
+
+async def merge_tables(parts: list[File], name: str) -> File:
+    """Download parquet Files, concatenate them (streaming, see `merge_local`) and upload the result."""
+    paths = await asyncio.gather(*(p.download() for p in parts))
+    out = Path(tempfile.mkdtemp()) / name
+    merge_local(list(paths), out)
+    print(f"{name}: {len(parts)} parts, {os.path.getsize(out) / 1e6:,.0f} MB")
+    return await _upload(out)
+
+
 def matrix_column(x: np.ndarray) -> pa.FixedSizeListArray:
-    """(n, d) numpy array -> fixed-size-list column, the natural parquet layout for fingerprints."""
+    """(n, d) numpy array -> fixed-size-list column, the natural parquet layout for fingerprints.
+
+    polars reads it back as an `Array(dtype, d)` column, and `.to_numpy()` gives the (n, d) array again.
+    """
     x = np.ascontiguousarray(x)
     return pa.FixedSizeListArray.from_arrays(pa.array(x.reshape(-1)), x.shape[1])
-
-
-def column_matrix(col: pa.ChunkedArray | pa.FixedSizeListArray, mask: np.ndarray | None = None) -> np.ndarray:
-    """Inverse of matrix_column, optionally keeping only rows where `mask` is True.
-
-    Fills one preallocated array chunk by chunk (zero-copy views of the Arrow buffers), so the
-    peak is the Arrow data plus the result - not several full-size temporaries.
-    """
-    chunks = col.chunks if isinstance(col, pa.ChunkedArray) else [col]
-    width = col.type.list_size
-    n = int(mask.sum()) if mask is not None else len(col)
-    out, pos, start = None, 0, 0
-    for chunk in chunks:
-        values = chunk.values.slice(chunk.offset * width, len(chunk) * width)
-        block = values.to_numpy(zero_copy_only=values.null_count == 0).reshape(-1, width)
-        if mask is not None:
-            block = block[mask[start : start + len(chunk)]]
-        if out is None:
-            out = np.empty((n, width), dtype=block.dtype)
-        out[pos : pos + len(block)] = block
-        pos, start = pos + len(block), start + len(chunk)
-    return out if out is not None else np.empty((0, width))
 
 
 def stable_fraction(keys: pa.Array) -> np.ndarray:

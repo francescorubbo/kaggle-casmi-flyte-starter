@@ -24,6 +24,7 @@ class CheMeleonFingerprint:
         mp.load_state_dict(ckpt["state_dict"])
         self.model = MPNN(message_passing=mp, agg=nn.MeanAggregation(), predictor=RegressionFFN(input_dim=mp.output_dim))
         self.model.eval()
+        self.dim = mp.output_dim
 
     def __call__(self, mols: list) -> np.ndarray:
         import torch
@@ -40,15 +41,12 @@ def featurize_smiles(smiles: list[str], batch_size: int = 256) -> tuple[np.ndarr
     RDLogger.DisableLog("rdApp.*")
     model = CheMeleonFingerprint()
     mols = [Chem.MolFromSmiles(s) for s in smiles]
-    valid = np.array([m is not None for m in mols])
-    out = None
+    valid = np.array([m is not None and m.GetNumAtoms() > 0 for m in mols], dtype=bool)  # "" parses to 0 atoms
+    out = np.zeros((len(smiles), model.dim), dtype=np.float32)  # also right for a shard with nothing valid
     idx = np.flatnonzero(valid)
     for start in range(0, len(idx), batch_size):
         batch = idx[start : start + batch_size]
-        emb = model([mols[i] for i in batch])
-        if out is None:
-            out = np.zeros((len(smiles), emb.shape[1]), dtype=np.float32)
-        out[batch] = emb
+        out[batch] = model([mols[i] for i in batch])
         if start // batch_size % 20 == 0:
             print(f"{start + len(batch):,}/{len(idx):,}")
     return out, valid

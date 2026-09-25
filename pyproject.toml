@@ -6,6 +6,7 @@ dependencies = [
     "flyte>=2.10.0",
     "pyarrow>=17",
     "numpy>=2",
+    "polars>=1.30",
 ]
 
 [dependency-groups]

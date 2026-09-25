@@ -37,6 +37,8 @@ def featurize_smiles(smiles: list[str], jar: str = CDK_JAR) -> tuple[dict[str, n
                 bits = fp.getBitFingerprint(mol).getSetbits()
                 out[name][i, np.asarray(bits, dtype=np.int64)] = 1
             valid[i] = True
-        except jpype.JException as e:  # unparsable SMILES, fingerprinter limits, ...
+        except Exception as e:  # Java (unparsable SMILES, fingerprinter limits, ...) or Python side
+            for bits in out.values():
+                bits[i] = 0  # a failure halfway leaves no partial fingerprint behind
             print(f"CDK failed on {s}: {e}")
     return out, valid

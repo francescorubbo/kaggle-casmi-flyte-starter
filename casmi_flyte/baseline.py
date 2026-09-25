@@ -16,7 +16,7 @@ from flyte.io import File
 
 from casmi_flyte.config import TEST_ADDUCTS, neutral_mass
 from casmi_flyte.metric import K, mrr_at_k
-from casmi_flyte.tables import column_matrix, read_table
+from casmi_flyte.tables import read_table, scan_table
 
 MZ_BINS = 1200  # 1 Da fragment bins, test precursors go up to ~1160
 LOSS_BINS = 300  # neutral losses (precursor - fragment) up to 300 Da
@@ -80,7 +80,7 @@ def _similarity(pred: np.ndarray, cands: np.ndarray, binary: bool) -> np.ndarray
 
 
 # Not a task yet: decide which environment (image, resources) this should run in and decorate it.
-# It needs numpy, pyarrow and scikit-learn; `masses` must provide `inchikey14`, `exact_mass`, `valid`.
+# It needs numpy, pyarrow, polars and scikit-learn; `masses` must provide `inchikey14`, `exact_mass`, `valid`.
 async def evaluate_representation(
     representation: str,
     features: File,
@@ -92,23 +92,29 @@ async def evaluate_representation(
     ppm: float = 10.0,
 ) -> dict[str, float]:
     """Train spectrum -> `representation` and score retrieval on the hold-out. Returns metrics."""
+    import polars as pl
     from sklearn.neural_network import MLPClassifier, MLPRegressor
 
     t0 = time.time()
-    # Memory matters here: a full library is up to 277k x 4860 bits. Keep one copy of the matrix.
-    lib = await read_table(features, columns=["inchikey14", "valid", representation])
-    mass_table = await read_table(masses, columns=["inchikey14", "exact_mass", "valid"])
-    mass_table = mass_table.filter(mass_table["valid"])
-    # (pyarrow joins do not support fixed-size-list payload columns: look the masses up instead)
-    mass_of = dict(zip(mass_table["inchikey14"].to_pylist(), mass_table["exact_mass"].to_pylist()))
-    all_keys = lib["inchikey14"].to_pylist()
-    all_mass = np.array([mass_of.get(k, np.nan) for k in all_keys])
-    keep = lib["valid"].to_numpy(zero_copy_only=False) & ~np.isnan(all_mass)
-    Y_lib = column_matrix(lib[representation], mask=keep)  # the one copy
-    del lib, mass_table, mass_of
-    lib_keys_all = np.array(all_keys)[keep]
-    lib_mass_all = all_mass[keep]
-    binary = Y_lib.dtype == np.uint8  # fingerprints are stored as uint8 bits, descriptors as float32
+    # Memory matters here: a full library is up to 276k x 4860 bits. polars filters and joins before
+    # anything is loaded, and reads the fingerprint column without pyarrow's overhead (see tables.py).
+    mass_of = (await scan_table(masses)).filter(pl.col("valid")).select("inchikey14", "exact_mass")
+    lib = (
+        (await scan_table(features))
+        .select("inchikey14", "valid", representation)
+        .filter(pl.col("valid"))
+        .join(mass_of, on="inchikey14", how="inner")
+        .filter(pl.col("exact_mass").is_not_nan())
+        .collect(engine="streaming")
+    )
+    col = lib[representation]
+    binary = col.dtype.inner == pl.UInt8  # fingerprints are stored as uint8 bits, descriptors as float32
+    # The streaming collect returns several chunks, so this copies: two copies until `del lib` below
+    # (~2 x 2.3 GB for CheMeleon at full scale). Float features are then standardised in place.
+    Y_lib = col.to_numpy(writable=not binary)
+    lib_keys_all = lib["inchikey14"].to_numpy()
+    lib_mass_all = lib["exact_mass"].to_numpy()
+    del lib, col
     if not binary:  # standardise continuous features (in place) so that no descriptor dominates the cosine
         Y_lib = np.nan_to_num(Y_lib.astype(np.float32, copy=False), copy=False)
         mu, sd = _column_stats(Y_lib)

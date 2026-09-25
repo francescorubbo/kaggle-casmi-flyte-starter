@@ -10,7 +10,6 @@ SOURCE_S3_ENDPOINT = os.getenv("CASMI_S3_ENDPOINT", "https://zhw-a.s3.cloud.swit
 SOURCE_S3_REGION = os.getenv("CASMI_S3_REGION", "ch")
 SOURCE_S3_SECRETS = ("casmi-s3-access-key-id", "casmi-s3-secret-access-key")  # `flyte create secret ...`
 
-
 # RDKit version used by the competition metric.
 RDKIT_VERSION = "2026.3.3"
 
